@@ -11,6 +11,23 @@ import numpy as np
 import sympy as sp
 import plotly.graph_objects as go
 
+from io import BytesIO
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image,
+)
+
 warnings.filterwarnings("ignore")
 
 
@@ -99,6 +116,8 @@ class AnalisadorLGR:
         self.max_x = 5.0
         self.span = 10.0
         self.fig = go.Figure()
+        self._last_rlist = None
+        self._last_klist = None
         self._configure_base_figure()
 
     # ------------------------------------------------------------------
@@ -918,28 +937,162 @@ class AnalisadorLGR:
             )
         )
 
+    def _calcular_lgr_numerico(self):
+        """Calcula numericamente os ramos do LGR sem depender do python-control.
+
+        Resolve diretamente o polinômio característico
+
+            D(s) + K N(s) = 0
+
+        para uma sequência de valores de K. As raízes são então ordenadas entre
+        pontos consecutivos pelo menor custo de deslocamento. O método é escrito
+        para ser robusto a polos múltiplos e a eventuais valores numéricos
+        inválidos retornados por ``numpy.roots``.
+        """
+        # K=0 é incluído explicitamente para que os polos de malha aberta apareçam
+        # no início do LGR. O restante usa escala logarítmica para acompanhar a
+        # evolução dos ramos até os zeros finitos/assíntotas.
+        klist = np.concatenate(([0.0], np.logspace(-5, 5, 1000)))
+        roots_all = []
+        expected_degree = self.char_poly.degree()
+
+        for kval in klist:
+            try:
+                poly = sp.Poly(
+                    sp.expand(self.char_expr.subs(self.K, float(kval))),
+                    self.s,
+                )
+                coeffs = np.asarray(
+                    [complex(c.evalf()) for c in poly.all_coeffs()],
+                    dtype=complex,
+                )
+
+                # Remove apenas coeficientes líderes efetivamente nulos. Isso
+                # evita mudar artificialmente o grau por ruído numérico.
+                while len(coeffs) > 1 and abs(coeffs[0]) < 1e-14:
+                    coeffs = coeffs[1:]
+
+                if len(coeffs) < 2 or not np.isfinite(coeffs).all():
+                    roots = np.full(expected_degree, np.nan + 1j * np.nan, dtype=complex)
+                else:
+                    roots = np.asarray(np.roots(coeffs), dtype=complex)
+                    if len(roots) != expected_degree or not np.isfinite(roots).all():
+                        roots = np.full(expected_degree, np.nan + 1j * np.nan, dtype=complex)
+            except Exception:
+                roots = np.full(expected_degree, np.nan + 1j * np.nan, dtype=complex)
+
+            roots_all.append(roots)
+
+        # O grau esperado é constante para K finito. Mantemos uma matriz
+        # retangular e marcamos amostras inválidas com NaN; elas são tratadas
+        # explicitamente no acompanhamento dos ramos e não são enviadas ao
+        # algoritmo de atribuição.
+        nbranches = expected_degree
+        ordered = np.full((len(klist), nbranches), np.nan + 1j * np.nan, dtype=complex)
+
+        # Primeira amostra: os polos de malha aberta. Se ela for válida, usamos
+        # diretamente; caso contrário, ordenamos deterministicamente.
+        first = roots_all[0]
+        if np.isfinite(first).all() and len(first) == nbranches:
+            ordered[0] = first
+        else:
+            valid = [r for r in first if np.isfinite(r)]
+            ordered[0, :len(valid)] = np.asarray(valid, dtype=complex)
+
+        def assign_roots(previous, current):
+            """Associa raízes válidas sem permitir NaN/inf no custo."""
+            prev_valid = [i for i, z in enumerate(previous) if np.isfinite(z)]
+            curr_valid = [j for j, z in enumerate(current) if np.isfinite(z)]
+
+            result = np.full_like(current, np.nan + 1j * np.nan)
+            if not prev_valid:
+                if curr_valid:
+                    # Ordem determinística para uma primeira amostra recuperada.
+                    for pos, j in enumerate(curr_valid):
+                        result[pos] = current[j]
+                return result
+
+            if not curr_valid:
+                return result
+
+            # Há poucos ramos no tipo de exercício da disciplina. Para n <= 8,
+            # testar permutações fornece a mesma ideia do problema de atribuição
+            # sem depender de scipy e sem aceitar custos inválidos.
+            if len(prev_valid) <= 8 and len(curr_valid) == len(prev_valid):
+                import itertools
+
+                best_perm = None
+                best_cost = float("inf")
+                prev_values = [previous[i] for i in prev_valid]
+                curr_values = [current[j] for j in curr_valid]
+                for perm in itertools.permutations(range(len(curr_values))):
+                    cost = sum(abs(prev_values[a] - curr_values[perm[a]]) for a in range(len(prev_values)))
+                    if np.isfinite(cost) and cost < best_cost:
+                        best_cost = float(cost)
+                        best_perm = perm
+
+                if best_perm is not None:
+                    for a, prev_index in enumerate(prev_valid):
+                        result[prev_index] = curr_values[best_perm[a]]
+                    return result
+
+            # Fallback guloso para ordens maiores ou conjuntos com cardinalidade
+            # diferente. Nunca calcula distância com entrada inválida.
+            unused = set(curr_valid)
+            for prev_index in prev_valid:
+                if not unused:
+                    break
+                prev_value = previous[prev_index]
+                best_index = min(
+                    unused,
+                    key=lambda idx: abs(prev_value - current[idx]),
+                )
+                if np.isfinite(prev_value) and np.isfinite(current[best_index]):
+                    result[prev_index] = current[best_index]
+                unused.remove(best_index)
+
+            # Se sobraram raízes atuais (situação patológica), elas são colocadas
+            # nas posições ainda vazias, sem tentar criar correspondências inválidas.
+            free_positions = [i for i, z in enumerate(result) if not np.isfinite(z)]
+            for pos, idx in zip(free_positions, sorted(unused)):
+                result[pos] = current[idx]
+            return result
+
+        for i in range(1, len(klist)):
+            ordered[i] = assign_roots(ordered[i - 1], roots_all[i])
+
+        return ordered, klist
+
     def calcular_lgr_exato(self):
         """Traça numericamente os ramos do LGR.
 
-        Quando python-control está disponível, usa root_locus. Caso contrário,
-        resolve diretamente D(s) + K N(s) = 0 para uma malha de valores de K.
+        Tenta utilizar ``python-control`` por compatibilidade com as versões
+        anteriores. Entretanto, algumas versões dessa biblioteca podem falhar
+        em ``root_locus`` quando há polos múltiplos ou raízes que se aproximam
+        muito entre si, produzindo uma exceção de dimensões no ``vstack``.
+        Nesse caso, o método faz automaticamente o cálculo direto de
+        D(s) + K N(s) = 0, sem interromper a resolução.
         """
+        rlist = None
+        klist = None
+
         if ctrl is not None:
             try:
                 rlist, klist = ctrl.root_locus(self.GH, plot=False)
-            except TypeError:
-                rlist, klist = ctrl.root_locus(self.GH, plot=False)
+
+                # Verifica se a biblioteca realmente devolveu uma matriz
+                # retangular válida para o gráfico.
+                rlist = np.asarray(rlist, dtype=complex)
+                klist = np.asarray(klist, dtype=float)
+                if rlist.ndim != 2 or klist.ndim != 1 or rlist.shape[0] != len(klist):
+                    raise ValueError("root_locus retornou dimensões incompatíveis.")
+            except Exception:
+                rlist, klist = self._calcular_lgr_numerico()
         else:
-            # Faixa automática suficientemente ampla para visualização; o cálculo
-            # analítico dos 12 passos não depende deste traçado numérico.
-            klist = np.concatenate(([0.0], np.logspace(-4, 4, 700)))
-            roots_all = []
-            for kval in klist:
-                poly = sp.Poly(sp.expand(self.char_expr.subs(self.K, float(kval))), self.s)
-                coeffs = np.asarray([float(c) for c in poly.all_coeffs()], dtype=float)
-                roots = np.roots(coeffs)
-                roots_all.append(roots)
-            rlist = np.asarray(roots_all)
+            rlist, klist = self._calcular_lgr_numerico()
+
+        self._last_rlist = rlist
+        self._last_klist = klist
 
         for i in range(rlist.shape[1]):
             self.fig.add_trace(
@@ -952,3 +1105,510 @@ class AnalisadorLGR:
                 )
             )
         return rlist, klist
+
+    # ------------------------------------------------------------------
+    # Exportação da resolução em PDF
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pdf_find_font(weight="normal"):
+        """Localiza uma fonte TTF de forma portável em Windows, Linux e macOS.
+
+        Prioriza as fontes distribuídas com o Matplotlib, que normalmente estão
+        disponíveis junto da própria instalação do Python e não dependem de
+        caminhos específicos do sistema operacional.
+        """
+        candidates = []
+
+        # 1) Fontes do próprio Matplotlib (preferência).
+        try:
+            prop = fm.FontProperties(family="DejaVu Sans", weight=weight)
+            found = fm.findfont(prop, fallback_to_default=True)
+            if found:
+                candidates.append(Path(found))
+        except Exception:
+            pass
+
+        # 2) Caminhos comuns do sistema como fallback.
+        if weight == "bold":
+            names = [
+                "DejaVuSans-Bold.ttf",
+                "NotoSans-Bold.ttf",
+                "LiberationSans-Bold.ttf",
+                "arialbd.ttf",
+                "segoeuib.ttf",
+            ]
+        else:
+            names = [
+                "DejaVuSans.ttf",
+                "NotoSans-Regular.ttf",
+                "LiberationSans-Regular.ttf",
+                "arial.ttf",
+                "segoeui.ttf",
+            ]
+
+        system_dirs = [
+            Path("/usr/share/fonts/truetype/dejavu"),
+            Path("/usr/share/fonts/truetype/noto"),
+            Path("/usr/share/fonts/truetype/liberation"),
+            Path("/usr/local/share/fonts"),
+            Path("C:/Windows/Fonts"),
+            Path("C:/Windows/Fonts/Arial"),
+            Path("/System/Library/Fonts"),
+            Path("/Library/Fonts"),
+        ]
+
+        for directory in system_dirs:
+            for name in names:
+                candidates.append(directory / name)
+
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                continue
+
+        return None
+
+    @staticmethod
+    def _pdf_font_setup():
+        """Configura fontes PDF sem depender de um caminho Linux fixo.
+
+        Em instalações normais, usa DejaVu Sans fornecida pelo Matplotlib.
+        Caso nenhuma TTF seja encontrada, usa as fontes padrão do ReportLab
+        (Helvetica/Helvetica-Bold), evitando que a exportação quebre por causa
+        de uma fonte ausente.
+        """
+        regular = AnalisadorLGR._pdf_find_font("normal")
+        bold = AnalisadorLGR._pdf_find_font("bold")
+
+        if regular and bold:
+            if "LGR-Regular" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("LGR-Regular", regular))
+            if "LGR-Bold" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("LGR-Bold", bold))
+            return "LGR-Regular", "LGR-Bold"
+
+        # Último fallback: fontes base 14 do PDF, que não exigem arquivos TTF.
+        return "Helvetica", "Helvetica-Bold"
+
+    @staticmethod
+    def _pdf_expr(expr):
+        """Representação legível de expressões SymPy em PDF textual."""
+        if expr is None:
+            return "-"
+        try:
+            text = str(sp.expand(expr))
+        except Exception:
+            text = str(expr)
+        text = text.replace("**", "^")
+        text = text.replace("*", "·")
+        text = text.replace("sqrt", "√")
+        text = text.replace("I", "j")
+        return text
+
+    def _gerar_grafico_png_pdf(self):
+        """Gera uma imagem estática do LGR para inserir no PDF."""
+        if self._last_rlist is None:
+            self.calcular_lgr_exato()
+
+        fig, ax = plt.subplots(figsize=(7.1, 5.2), dpi=170)
+        ax.axhline(0, linewidth=1.0)
+        ax.axvline(0, linewidth=1.0)
+
+        rlist = np.asarray(self._last_rlist)
+        if rlist.ndim == 2:
+            for i in range(rlist.shape[1]):
+                ax.plot(np.real(rlist[:, i]), np.imag(rlist[:, i]), linewidth=1.7)
+
+        # Segmentos reais
+        for a, b in self.real_segments:
+            xs = [a if not math.isinf(a) else b - self.span,
+                  b if not math.isinf(b) else a + self.span]
+            ax.plot(xs, [0, 0], linewidth=4)
+
+        # Assíntotas
+        raio = self.span * 1.5
+        if self.assymptote_center is not None:
+            for ang in self.assymptote_angles:
+                rad = math.radians(ang)
+                dx, dy = math.cos(rad), math.sin(rad)
+                ax.plot(
+                    [self.assymptote_center, self.assymptote_center + raio * dx],
+                    [0, raio * dy],
+                    linestyle="--", linewidth=1.1, alpha=0.65,
+                )
+
+        # Polos agrupados por multiplicidade.
+        for group in self._group_points(self.polos):
+            alpha = 0.42 if group["multiplicity"] > 1 else 1.0
+            ax.scatter(
+                [group["point"].real], [group["point"].imag],
+                marker="x", s=95, linewidths=2.0, alpha=alpha,
+            )
+            if group["multiplicity"] > 1:
+                ax.annotate(f"m={group['multiplicity']}",
+                            (group["point"].real, group["point"].imag),
+                            xytext=(5, 5), textcoords="offset points", fontsize=8)
+
+        for group in self._group_points(self.zeros):
+            ax.scatter(
+                [group["point"].real], [group["point"].imag],
+                marker="o", s=90, facecolors="none", linewidths=1.8,
+            )
+
+        # Pontos de saída/chegada
+        for c in self.breakaway_candidates:
+            if c.get("valido") and c.get("real"):
+                ax.scatter([c["s"].real], [0], marker="s", s=40)
+
+        # Cruzamentos imaginários
+        for c in self.crossings:
+            ax.scatter([0, 0], [c["w"], -c["w"]], marker="D", s=38)
+
+        # Ponto de teste, quando disponível via último registro.
+        if hasattr(self, "_pdf_test_point") and self._pdf_test_point is not None:
+            pt = complex(self._pdf_test_point)
+            ax.scatter([pt.real], [pt.imag], marker="*", s=135)
+
+        span = max(self.span, 4.0)
+        xr = (self.min_x - 0.15 * span, self.max_x + 0.15 * span)
+        if xr[0] == xr[1]:
+            xr = (-5, 5)
+        yr_half = max(span * 0.62, 2.5)
+        ax.set_xlim(*xr)
+        ax.set_ylim(-yr_half, yr_half)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("Eixo Real (Re)")
+        ax.set_ylabel("Eixo Imaginário (Im)")
+        ax.set_title("Lugar Geométrico das Raízes")
+        ax.grid(True, alpha=0.18)
+        fig.tight_layout()
+
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+
+    def gerar_pdf_resolucao(
+        self, p1, p4, p7, p8, p9, p10, ptest, ponto_teste,
+    ) -> bytes:
+        """Gera um PDF completo da resolução calculada pelo aplicativo."""
+        font_regular, font_bold = self._pdf_font_setup()
+        self._pdf_test_point = ponto_teste
+        if self._last_rlist is None:
+            self.calcular_lgr_exato()
+
+        buf = BytesIO()
+        doc = SimpleDocTemplate(
+            buf, pagesize=A4,
+            rightMargin=1.5 * cm, leftMargin=1.5 * cm,
+            topMargin=1.45 * cm, bottomMargin=1.45 * cm,
+            title="Resolução de Lugar Geométrico das Raízes",
+            author="Calculadora LGR",
+        )
+        styles = getSampleStyleSheet()
+        title = ParagraphStyle(
+            "LGRTitle", parent=styles["Title"], fontName=font_bold,
+            fontSize=18, leading=22, alignment=TA_CENTER, spaceAfter=10,
+        )
+        h1 = ParagraphStyle(
+            "LGRH1", parent=styles["Heading1"], fontName=font_bold,
+            fontSize=13, leading=16, spaceBefore=8, spaceAfter=7,
+        )
+        h2 = ParagraphStyle(
+            "LGRH2", parent=styles["Heading2"], fontName=font_bold,
+            fontSize=10.5, leading=13, spaceBefore=5, spaceAfter=4,
+        )
+        body = ParagraphStyle(
+            "LGRBody", parent=styles["BodyText"], fontName=font_regular,
+            fontSize=8.8, leading=12, spaceAfter=4,
+        )
+        small = ParagraphStyle(
+            "LGRSmall", parent=body, fontSize=7.3, leading=9.5,
+        )
+        eq = ParagraphStyle(
+            "LGREq", parent=body, fontName=font_regular, fontSize=8.5,
+            leading=11, leftIndent=10, spaceAfter=4,
+        )
+
+        story = []
+        story.append(Paragraph("Resolução - Lugar Geométrico das Raízes (LGR)", title))
+        story.append(Paragraph(
+            "Documento gerado automaticamente a partir dos valores informados no aplicativo. "
+            "A resolução apresenta as etapas intermediárias utilizadas para a reprodução manual.", body
+        ))
+        story.append(Spacer(1, 3))
+
+        story.append(Paragraph("Dados do problema", h1))
+        story.append(Paragraph(
+            f"G(s) = {escape(self._pdf_expr(self._poly_to_expr(self.numG)))} / "
+            f"({escape(self._pdf_expr(self._poly_to_expr(self.denG)))})", body
+        ))
+        story.append(Paragraph(
+            f"H(s) = {escape(self._pdf_expr(self._poly_to_expr(self.numH)))} / "
+            f"({escape(self._pdf_expr(self._poly_to_expr(self.denH)))})", body
+        ))
+        story.append(Paragraph(
+            f"Ponto de teste: s_t = {escape(self._fmt_complex(complex(ponto_teste), 6))}", body
+        ))
+
+        # Passos 1-3
+        story.append(Paragraph("Passo 1 - Polinômio característico", h1))
+        story.append(Paragraph("1 + G(s)H(s) = 0", eq))
+        story.append(Paragraph(
+            f"1 + K·P(s) = 1 + K·({escape(self._pdf_expr(p1['gh']) )}) = 0", eq
+        ))
+        story.append(Paragraph(
+            f"P(s) = {escape(self._pdf_expr(p1['num_expr']))} / {escape(self._pdf_expr(p1['den_expr']))}", body
+        ))
+        story.append(Paragraph(
+            f"Forma fatorada: P(s) = C·Π(s-z_i) / Π(s-p_i), com C = {escape(self._pdf_expr(self.ganho_constante))}", body
+        ))
+        story.append(Paragraph(
+            f"Φ(s,K) = {escape(self._pdf_expr(p1['char_expr']))} = 0", eq
+        ))
+        story.append(Paragraph(
+            f"∂Φ/∂s = {escape(self._pdf_expr(p1['char_derivative']))}", eq
+        ))
+
+        story.append(Paragraph("Passo 2 - Pólos e zeros", h1))
+        story.append(Paragraph(
+            "Pólos: " + ", ".join(self._fmt_complex(p, 5) for p in self.polos) if self.polos else "Pólos: nenhum", body
+        ))
+        story.append(Paragraph(
+            "Zeros: " + (", ".join(self._fmt_complex(z, 5) for z in self.zeros) if self.zeros else "nenhum"), body
+        ))
+        story.append(Paragraph(f"nP = {self.np}; nZ = {self.nz}.", body))
+
+        story.append(Paragraph("Passo 3 - Esboço inicial no plano-s", h1))
+        story.append(Paragraph("X = pólo; O = zero. O LGR inicia nos pólos e termina nos zeros (finitos ou infinitos).", body))
+
+        # Passo 4
+        story.append(Paragraph("Passo 4 - Segmentos do eixo real", h1))
+        for item in p4.get("testes", []):
+            story.append(Paragraph(
+                f"Teste s = {item['ponto_teste']:.6f}: N_direita = {item['elementos_direita']} ({item['paridade']}). "
+                f"Intervalo ({'-∞' if math.isinf(item['esquerda']) else f'{item['esquerda']:.6f}'}, "
+                f"{'+∞' if math.isinf(item['direita']) else f'{item['direita']:.6f}'}) -> "
+                f"{'pertence' if item['pertence'] else 'não pertence'} ao LGR.", small
+            ))
+        story.append(Paragraph(
+            "Segmentos pertencentes: " + (", ".join(
+                f"({'-∞' if math.isinf(a) else f'{a:.5f}'}, {'+∞' if math.isinf(b) else f'{b:.5f}'})"
+                for a, b in p4.get("segmentos", [])
+            ) if p4.get("segmentos") else "nenhum"), body
+        ))
+
+        story.append(Paragraph("Passo 5 - Número de lugares separados", h1))
+        story.append(Paragraph(f"LS = nP = {self.np}. Logo, existem {self.np} ramos.", body))
+
+        story.append(Paragraph("Passo 6 - Simetria", h1))
+        story.append(Paragraph("Como os coeficientes do sistema são reais, o LGR é simétrico em relação ao eixo real.", body))
+
+        # Passo 7
+        story.append(Paragraph("Passo 7 - Assíntotas", h1))
+        if p7.get("numero", 0) > 0:
+            story.append(Paragraph(f"NA = nP - nZ = {p7['numero']}.", body))
+            story.append(Paragraph(
+                f"σA = (Σp_i - Σz_i)/(nP-nZ) = "
+                f"({escape(self._pdf_expr(sp.expand(p7['soma_polos'])))} - {escape(self._pdf_expr(sp.expand(p7['soma_zeros'])))})/{p7['numero']} = {p7['centro']:.6f}",
+                eq,
+            ))
+            for q, angle in enumerate(p7.get("angulos", [])):
+                story.append(Paragraph(
+                    f"φA,{q} = (2·{q}+1)·180°/{p7['numero']} = {angle:.6f}°", small
+                ))
+        else:
+            story.append(Paragraph("nP - nZ ≤ 0: não há assíntotas para o infinito.", body))
+
+        # Passo 8
+        story.append(Paragraph("Passo 8 - Pontos de saída/chegada", h1))
+        story.append(Paragraph(
+            f"K(s) = -D(s)/N(s) = -({escape(self._pdf_expr(p8['K_num']))})/({escape(self._pdf_expr(p8['K_den']))})", eq
+        ))
+        story.append(Paragraph(f"dK/ds = {escape(self._pdf_expr(p8['dK_ds']))}", eq))
+        story.append(Paragraph("dK/ds = 0 ⇔ D'(s)N(s) - D(s)N'(s) = 0", eq))
+        story.append(Paragraph(
+            f"D'(s) = {escape(self._pdf_expr(p8['Dp']))}; N'(s) = {escape(self._pdf_expr(p8['Np']))}.", body
+        ))
+        story.append(Paragraph(
+            f"Equação numerador: {escape(self._pdf_expr(p8['equacao_numerador']))} = 0", eq
+        ))
+        for cand in p8.get("candidatos", []):
+            if cand.get("real"):
+                k = cand.get("K")
+                ks = "indefinido" if k is None else f"{k:.6f}"
+                status = "VÁLIDO" if cand.get("valido") else "ignorado"
+                story.append(Paragraph(
+                    f"Candidato s = {cand['s'].real:.6f}, K = {ks}: {status} para K>0 e segmento real.", small
+                ))
+            else:
+                story.append(Paragraph(
+                    f"Candidato complexo s = {escape(self._fmt_complex(cand['s'], 6))}: ignorado.", small
+                ))
+
+        # Passo 9
+        story.append(Paragraph("Passo 9 - Cruzamento do eixo imaginário (Routh-Hurwitz)", h1))
+        routh = p9.get("routh", {})
+        table = routh.get("table", [])
+        if table:
+            max_cols = max(len(row) for _, row in table)
+            data = [["Linha"] + [f"Coluna {i+1}" for i in range(max_cols)]]
+            for power, row in table:
+                data.append([f"s^{int(power)}"] + [self._pdf_expr(v) for v in row] + ["0"] * (max_cols - len(row)))
+            t = Table(data, repeatRows=1, hAlign="LEFT")
+            t.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), "LGR-Regular"),
+                ("FONTNAME", (0, 0), (-1, 0), "LGR-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 5))
+        story.append(Paragraph(
+            "Primeira coluna: " + ", ".join(
+                f"s^{int(power)}: {escape(self._pdf_expr(row[0]))}" for power, row in table
+            ), small
+        ))
+        story.append(Paragraph(
+            "Valores positivos na primeira coluna determinam a faixa de estabilidade (para coeficiente líder positivo).", body
+        ))
+        if routh.get("K_candidates"):
+            story.append(Paragraph(
+                "Candidatos por anulação da primeira coluna: " + ", ".join(f"K = {k:.6f}" for k in routh["K_candidates"]), body
+            ))
+        if routh.get("used_epsilon"):
+            story.append(Paragraph("Foi utilizado ε>0 devido a primeiro elemento nulo em uma linha da tabela de Routh.", small))
+
+        s2 = p9.get("s2_method", {})
+        if s2.get("disponivel"):
+            story.append(Paragraph("Determinação do cruzamento pela equação da linha s²", h2))
+            a, b = s2["linha_s2"]
+            story.append(Paragraph(f"Linha s²: {escape(self._pdf_expr(a))}·s² + {escape(self._pdf_expr(b))} = 0", eq))
+            story.append(Paragraph(f"Com s=jω: {escape(self._pdf_expr(s2['aux_jw']))}=0", eq))
+            if s2.get("k_expression") is not None:
+                story.append(Paragraph(f"Da equação de s²: K = {escape(self._pdf_expr(s2['k_expression']))}", eq))
+            story.append(Paragraph(f"Re[Φ(jω,K)] = {escape(self._pdf_expr(s2['char_re']))}", eq))
+            story.append(Paragraph(f"Im[Φ(jω,K)] = {escape(self._pdf_expr(s2['char_im']))}", eq))
+            story.append(Paragraph(f"Im[Φ]/ω = 0 (ω≠0) ⇒ {escape(self._pdf_expr(s2['omega_equation']))} = 0", eq))
+            for calc in s2.get("calculos", []):
+                story.append(Paragraph(
+                    f"ω = {calc['w']:.6f} ⇒ K = {calc['K']:.6f}; "
+                    f"verificação Re[Φ] = {calc['real_residual']:.3e}, Im[Φ] = {calc['imag_residual']:.3e}.", small
+                ))
+        if p9.get("cruzamentos"):
+            for c in p9["cruzamentos"]:
+                story.append(Paragraph(
+                    f"Cruzamento: s = ±j{c['w']:.6f}, K = {c['K']:.6f}.", body
+                ))
+        else:
+            story.append(Paragraph("Não foi identificado cruzamento do eixo imaginário para K>0.", body))
+
+        # Passo 10
+        story.append(Paragraph("Passo 10 - Ângulos de partida e chegada", h1))
+        if not p10.get("resultados"):
+            story.append(Paragraph("Não há pólos/zeros complexos que exijam cálculo de ângulo.", body))
+        for item in p10.get("resultados", []):
+            tipo = "partida" if item["tipo"] == "partida" else "chegada"
+            story.append(Paragraph(
+                f"Ângulo de {tipo} em s = {escape(self._fmt_complex(item['ponto'], 5))}", h2
+            ))
+            vectors = item.get("vetores_polos", []) + item.get("vetores_zeros", [])
+            if vectors:
+                data = [["Vetor", "Origem", "Destino", "ΔRe", "ΔIm", "|v|", "Ângulo (°)"]]
+                for i, v in enumerate(vectors, 1):
+                    data.append([str(i), self._fmt_complex(v.origem, 4), self._fmt_complex(v.destino, 4),
+                                 f"{v.dx:.4f}", f"{v.dy:.4f}", f"{v.magnitude:.4f}", f"{v.angulo_deg:.4f}"])
+                vt = Table(data, repeatRows=1, hAlign="LEFT")
+                vt.setStyle(TableStyle([
+                    ("FONTNAME", (0, 0), (-1, -1), "LGR-Regular"),
+                    ("FONTNAME", (0, 0), (-1, 0), "LGR-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 6.3),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ]))
+                story.append(vt)
+            if item["tipo"] == "partida":
+                story.append(Paragraph(
+                    f"Σθ_i = {item['soma_polos']:.4f}°; Σφ_j = {item['soma_zeros']:.4f}°; "
+                    f"θ_partida = 180° - Σθ_i + Σφ_j = {item['angulo']:.4f}°.", body
+                ))
+            else:
+                story.append(Paragraph(
+                    f"Σφ_i = {item['soma_zeros']:.4f}°; Σθ_j = {item['soma_polos']:.4f}°; "
+                    f"θ_chegada = 180° - Σφ_i + Σθ_j = {item['angulo']:.4f}°.", body
+                ))
+
+        # Passos 11 e 12
+        story.append(Paragraph("Passo 11 - Teste da condição de ângulo", h1))
+        story.append(Paragraph("Para cada vetor: θ = atan2(ΔIm, ΔRe) e |v| = √[(ΔRe)^2 + (ΔIm)^2].", body))
+        vectors = ptest.get("vetores_polos", []) + ptest.get("vetores_zeros", [])
+        if vectors:
+            data = [["Vetor", "Origem", "Destino", "ΔRe", "ΔIm", "|v|", "Ângulo (°)"]]
+            for i, v in enumerate(vectors, 1):
+                data.append([str(i), self._fmt_complex(v.origem, 4), self._fmt_complex(v.destino, 4),
+                             f"{v.dx:.4f}", f"{v.dy:.4f}", f"{v.magnitude:.4f}", f"{v.angulo_deg:.4f}"])
+            vt = Table(data, repeatRows=1, hAlign="LEFT")
+            vt.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), "LGR-Regular"),
+                ("FONTNAME", (0, 0), (-1, 0), "LGR-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 6.3),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ]))
+            story.append(vt)
+        story.append(Paragraph(
+            f"arg(C) = {ptest['fase_constante_deg']:.4f}°; Σθ_i = {ptest['soma_angulos_polos']:.4f}°; "
+            f"Σφ_j = {ptest['soma_angulos_zeros']:.4f}°.", body
+        ))
+        story.append(Paragraph(
+            f"∠P(s_t) = arg(C) + Σφ_j - Σθ_i = {ptest['fase_bruta']:.4f}° ≡ {ptest['fase_mod']:.4f}° (mod 360°).", eq
+        ))
+        story.append(Paragraph(
+            "Resultado: ponto pertence ao LGR para K>0." if ptest["pertence"] else "Resultado: ponto não pertence ao LGR para K>0.", body
+        ))
+
+        story.append(Paragraph("Passo 12 - Determinação do ganho K pela condição de módulo", h1))
+        if ptest["pertence"]:
+            story.append(Paragraph(
+                "|K·P(s_t)| = 1 ⇒ K = Π|s_t-p_i| / (|C|·Π|s_t-z_j|).", eq
+            ))
+            story.append(Paragraph(
+                f"K = {ptest['produto_mod_polos']:.6f} / "
+                f"(|{escape(self._pdf_expr(ptest['ganho_constante']))}|·{ptest['produto_mod_zeros']:.6f}) "
+                f"= {ptest['K']:.6f}.", eq
+            ))
+            story.append(Paragraph(
+                f"Logo, para s_t = {escape(self._fmt_complex(ponto_teste, 6))}, K = {ptest['K']:.6f}.", body
+            ))
+        else:
+            story.append(Paragraph("Como a condição de ângulo não foi satisfeita, não se calcula K para K>0.", body))
+
+        # Gráfico final
+        story.append(Paragraph("Diagrama final do LGR", h1))
+        story.append(Image(self._gerar_grafico_png_pdf(), width=17.2*cm, height=12.1*cm))
+
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(
+            "Fim da resolução. Os valores e cálculos deste documento correspondem aos dados informados no aplicativo.", small
+        ))
+
+        def footer(canvas, doc):
+            canvas.saveState()
+            canvas.setFont("LGR-Regular", 7)
+            canvas.drawString(1.5*cm, 0.75*cm, "Calculadora LGR - resolução automática")
+            canvas.drawRightString(A4[0]-1.5*cm, 0.75*cm, f"Página {doc.page}")
+            canvas.restoreState()
+
+        doc.build(story, onFirstPage=footer, onLaterPages=footer)
+        return buf.getvalue()
+
+    def _poly_to_expr(self, coeffs):
+        """Converte lista de coeficientes em polinômio simbólico."""
+        return sp.Poly.from_list(list(np.asarray(coeffs, dtype=float)), gens=self.s).as_expr()

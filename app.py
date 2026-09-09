@@ -195,7 +195,7 @@ if submit_button:
         # ------------------------------------------------------------------
         st.subheader("Passo 4 — Segmentos do eixo real que pertencem ao LGR")
         st.markdown(
-            "Um ponto pertence ao LGR quando há um "
+            "Regra usada no material: um ponto pertence ao LGR quando há um "
             "**número ímpar de pólos e zeros reais à sua direita**."
         )
         for item in p4["testes"]:
@@ -247,7 +247,7 @@ if submit_button:
         # Passo 8
         # ------------------------------------------------------------------
         st.subheader("Passo 8 — Ponto(s) de saída/chegada no eixo real")
-        st.markdown("Primeiro isolamos $K$ como função de $s$ e depois impomos $dK/ds=0$.")
+        st.markdown("A resolução segue exatamente a ideia do material: primeiro isolamos $K$ como função de $s$ e depois impomos $dK/ds=0$.")
         st.latex(rf"K(s)=-\frac{{D(s)}}{{N(s)}}=-\frac{{{latex(p8['K_den'])}}}{{{latex(p8['K_num'])}}}")
         st.markdown("**Derivando:**")
         st.latex(rf"\frac{{dK}}{{ds}}={latex(p8['dK_ds'])}")
@@ -452,6 +452,37 @@ if submit_button:
         analisador.adicionar_ponto_teste(ponto_teste)
         analisador.calcular_lgr_exato()
         st.plotly_chart(analisador.fig, use_container_width=True, key="fig_final")
+
+        # ------------------------------------------------------------------
+        # Exportação da resolução
+        # ------------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("Exportar resolução")
+        st.markdown(
+            "Use o botão abaixo para gerar um PDF contendo os dados informados e "
+            "toda a resolução calculada nos 12 passos, incluindo tabelas, contas "
+            "intermediárias e o diagrama final do LGR."
+        )
+
+        pdf_resolucao = analisador.gerar_pdf_resolucao(
+            p1=p1,
+            p4=p4,
+            p7=p7,
+            p8=p8,
+            p9=p9,
+            p10=p10,
+            ptest=ptest,
+            ponto_teste=ponto_teste,
+        )
+
+        st.download_button(
+            label="Baixar resolução completa em PDF",
+            data=pdf_resolucao,
+            file_name="resolucao_LGR.pdf",
+            mime="application/pdf",
+            on_click="ignore",
+            use_container_width=True,
+        )
 
     except Exception as exc:
         st.error("Erro na execução. Verifique os coeficientes informados.")
