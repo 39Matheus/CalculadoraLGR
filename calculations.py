@@ -67,6 +67,16 @@ class AnalisadorLGR:
         self.den_expr = sp.factor(self.den_expr)
         self.P_expr = sp.cancel(self.num_expr / self.den_expr)
 
+        # Ganho constante de P(s) quando escrito na forma fatorada:
+        # P(s) = C * prod(s-z_i) / prod(s-p_i).
+        num_poly = sp.Poly(self.num_expr, self.s)
+        den_poly = sp.Poly(self.den_expr, self.s)
+        self.ganho_constante = sp.simplify(num_poly.LC() / den_poly.LC())
+        ganho_num = float(sp.N(self.ganho_constante))
+        if abs(ganho_num) < 1e-15:
+            raise ValueError("O ganho constante de P(s) não pode ser zero.")
+        self.fase_constante_deg = 0.0 if ganho_num > 0 else 180.0
+
         # Polinômio característico: D(s) + K N(s) = 0.
         self.char_expr = sp.expand(self.den_expr + self.K * self.num_expr)
         self.char_poly = sp.Poly(self.char_expr, self.s)
@@ -83,6 +93,7 @@ class AnalisadorLGR:
         self.breakaway_candidates: List[Dict[str, Any]] = []
         self.crossings: List[Dict[str, float]] = []
         self.departure_arrival: List[Dict[str, Any]] = []
+        self.routh_used_epsilon = False
 
         self.min_x = -5.0
         self.max_x = 5.0
@@ -140,24 +151,64 @@ class AnalisadorLGR:
         self.fig.add_hline(y=0, line_width=1.5, line_color="black", opacity=0.5)
         self.fig.add_vline(x=0, line_width=1.5, line_color="black", opacity=0.5)
 
+    def _group_points(self, points: List[complex], tol: float = 1e-7):
+        """Agrupa pontos coincidentes (dentro de uma tolerância) e informa multiplicidade."""
+        groups = []
+        for point in points:
+            for group in groups:
+                if abs(point - group["point"]) < tol:
+                    group["multiplicity"] += 1
+                    # Mantém uma média para reduzir ruído numérico.
+                    m = group["multiplicity"]
+                    group["point"] = ((m - 1) * group["point"] + point) / m
+                    break
+            else:
+                groups.append({"point": point, "multiplicity": 1})
+        return groups
+
     def _add_polos_zeros(self):
-        if self.polos:
-            self.fig.add_trace(
-                go.Scatter(
-                    x=np.real(self.polos),
-                    y=np.imag(self.polos),
-                    mode="markers",
-                    marker=dict(symbol="x", size=12, color="red", line=dict(width=2)),
-                    name="Pólos",
+        pole_groups = self._group_points(self.polos)
+        zero_groups = self._group_points(self.zeros)
+
+        if pole_groups:
+            norm = [g for g in pole_groups if g["multiplicity"] == 1]
+            repeated = [g for g in pole_groups if g["multiplicity"] > 1]
+
+            if norm:
+                self.fig.add_trace(
+                    go.Scatter(
+                        x=[g["point"].real for g in norm],
+                        y=[g["point"].imag for g in norm],
+                        mode="markers",
+                        marker=dict(symbol="x", size=14, color="red", opacity=1.0, line=dict(width=2)),
+                        customdata=[g["multiplicity"] for g in norm],
+                        hovertemplate="Pólo: %{x:.5g} + j%{y:.5g}<br>Multiplicidade: %{customdata}<extra></extra>",
+                        name="Pólos",
+                    )
                 )
-            )
-        if self.zeros:
+
+            if repeated:
+                self.fig.add_trace(
+                    go.Scatter(
+                        x=[g["point"].real for g in repeated],
+                        y=[g["point"].imag for g in repeated],
+                        mode="markers",
+                        marker=dict(symbol="x", size=14, color="red", opacity=0.42, line=dict(width=2)),
+                        customdata=[g["multiplicity"] for g in repeated],
+                        hovertemplate="Pólo múltiplo: %{x:.5g} + j%{y:.5g}<br>Multiplicidade: %{customdata}<extra></extra>",
+                        name="Pólos múltiplos",
+                    )
+                )
+
+        if zero_groups:
             self.fig.add_trace(
                 go.Scatter(
-                    x=np.real(self.zeros),
-                    y=np.imag(self.zeros),
+                    x=[g["point"].real for g in zero_groups],
+                    y=[g["point"].imag for g in zero_groups],
                     mode="markers",
-                    marker=dict(symbol="circle-open", size=12, color="blue", line=dict(width=2)),
+                    marker=dict(symbol="circle-open", size=13, color="blue", line=dict(width=2)),
+                    customdata=[g["multiplicity"] for g in zero_groups],
+                    hovertemplate="Zero: %{x:.5g} + j%{y:.5g}<br>Multiplicidade: %{customdata}<extra></extra>",
                     name="Zeros",
                 )
             )
@@ -188,6 +239,7 @@ class AnalisadorLGR:
             "P_expr": self.P_expr,
             "zeros": self.zeros,
             "polos": self.polos,
+            "ganho_constante": self.ganho_constante,
         }
 
     def dados_passo1(self) -> Dict[str, Any]:
@@ -329,6 +381,11 @@ class AnalisadorLGR:
         self.breakaway_candidates = candidatos
         return {
             "K_of_s": K_of_s,
+            "K_num": self.den_expr,
+            "K_den": self.num_expr,
+            # Aliases mantidos para compatibilidade com versões anteriores da interface.
+            "den_expr": self.den_expr,
+            "num_expr": self.num_expr,
             "dK_ds": dK_ds,
             "numerador_derivada": numerador_derivada,
             "denominador_derivada": denominador_derivada,
@@ -363,6 +420,8 @@ class AnalisadorLGR:
         table[0][: len(coeffs[0::2])] = coeffs[0::2]
         table[1][: len(coeffs[1::2])] = coeffs[1::2]
 
+        epsilon = sp.Symbol(r"\epsilon", positive=True)
+        used_epsilon = False
         for i in range(2, n + 1):
             for j in range(cols - 1):
                 a = table[i - 2][0]
@@ -370,11 +429,13 @@ class AnalisadorLGR:
                 c = table[i - 1][0]
                 d = table[i - 1][j + 1]
                 if sp.simplify(c) == 0:
-                    # Representação simbólica equivalente; a aplicação não precisa
-                    # executar o caso de epsilon automaticamente.
-                    table[i][j] = sp.nan
-                else:
-                    table[i][j] = sp.factor((c * b - a * d) / c)
+                    c = epsilon
+                    used_epsilon = True
+                table[i][j] = sp.factor((c * b - a * d) / c)
+
+        # O indicador é retornado em atributo auxiliar para a interface poder
+        # informar que o caso especial epsilon foi necessário.
+        self.routh_used_epsilon = used_epsilon
 
         return [(sp.Integer(rows[i]), [sp.factor(v) for v in table[i]]) for i in range(n + 1)]
 
@@ -420,6 +481,7 @@ class AnalisadorLGR:
             "first_column": first_column,
             "K_candidates": K_candidates,
             "crossing_candidates": detailed,
+            "used_epsilon": self.routh_used_epsilon,
         }
 
     def _auxiliary_polynomial_from_routh(self, K_value: float, table):
@@ -468,6 +530,134 @@ class AnalisadorLGR:
             "roots": aux_roots,
         }
 
+    def _cruzamento_por_equacao_s2(self, routh: Dict[str, Any]) -> Dict[str, Any]:
+        """Aplica explicitamente a equação da linha s² para obter K no cruzamento.
+
+        Para o caso de quarta ordem do material, a linha s² tem a forma
+        b1*s² + b2 = 0. Com s=j*w: -b1*w² + b2 = 0.
+        O valor de w é obtido pela parte imaginária da equação característica e,
+        em seguida, K é obtido substituindo esse w na equação auxiliar da linha s².
+        A equação real da característica é usada como verificação final.
+        """
+        result = {
+            "disponivel": False,
+            "linha_s2": None,
+            "auxiliary": None,
+            "aux_jw": None,
+            "char_re": None,
+            "char_im": None,
+            "omega_equation": None,
+            "k_expression": None,
+            "omega_values": [],
+            "calculos": [],
+            "cruzamentos": [],
+        }
+
+        row_s2 = None
+        for power, row in routh["table"]:
+            if int(power) == 2:
+                row_s2 = row
+                break
+        if row_s2 is None or len(row_s2) < 2:
+            return result
+
+        a = sp.factor(sp.sympify(row_s2[0]))
+        b = sp.factor(sp.sympify(row_s2[1]))
+        if a == 0 and b == 0:
+            return result
+
+        aux = sp.expand(a * self.s**2 + b)
+        w = self.w
+        aux_jw = sp.factor(sp.expand(aux.subs(self.s, sp.I * w)).as_real_imag()[0])
+        try:
+            k_solutions = sp.solve(sp.Eq(aux_jw, 0), self.K)
+            k_expression = sp.factor(k_solutions[0]) if k_solutions else None
+        except Exception:
+            k_expression = None
+        # Equação característica em s=j*w.
+        phi_jw = sp.expand(self.char_expr.subs(self.s, sp.I * w))
+        char_re = sp.factor(sp.re(phi_jw).expand())
+        char_im = sp.factor(sp.im(phi_jw).expand())
+
+        # Para w != 0, a parte imaginária é dividida por w. Isso reproduz a
+        # substituição usada manualmente no caso típico de ordem 4.
+        if sp.simplify(char_im.subs(w, 0)) == 0:
+            omega_equation = sp.factor(sp.cancel(char_im / w))
+        else:
+            omega_equation = char_im
+
+        omega_values = []
+        try:
+            roots_omega = sp.nroots(sp.Poly(omega_equation, w))
+            for root in roots_omega:
+                z = complex(root)
+                if abs(z.imag) < 1e-7 and z.real > 1e-7:
+                    omega_values.append(float(z.real))
+        except Exception:
+            pass
+
+        # Fallback simbólico para equações simples em w².
+        if not omega_values:
+            try:
+                sols = sp.solve(sp.Eq(omega_equation, 0), w)
+                for sol in sols:
+                    z = complex(sp.N(sol))
+                    if abs(z.imag) < 1e-7 and z.real > 1e-7:
+                        omega_values.append(float(z.real))
+            except Exception:
+                pass
+
+        calculations = []
+        crossings = []
+        for omega in omega_values:
+            aux_num = sp.N(aux_jw.subs(w, omega))
+            try:
+                K_solutions = sp.solve(sp.Eq(aux_num, 0), self.K)
+            except Exception:
+                K_solutions = []
+            for K_sol in K_solutions:
+                try:
+                    kval = complex(sp.N(K_sol))
+                except Exception:
+                    continue
+                if abs(kval.imag) > 1e-7 or kval.real <= 0:
+                    continue
+                kval_f = float(kval.real)
+                real_residual = float(sp.N(char_re.subs({w: omega, self.K: kval_f})))
+                imag_residual = float(sp.N(char_im.subs({w: omega, self.K: kval_f})))
+                valid = abs(real_residual) < 1e-4 and abs(imag_residual) < 1e-4
+                calculations.append({
+                    "w": omega,
+                    "K": kval_f,
+                    "s": complex(0.0, omega),
+                    "real_residual": real_residual,
+                    "imag_residual": imag_residual,
+                    "valido": valid,
+                })
+                if valid:
+                    crossings.append({"w": omega, "K": kval_f, "origem": "Equação de s²"})
+
+        # Evita duplicatas.
+        unique = []
+        for c in crossings:
+            if not any(abs(c["w"] - u["w"]) < 1e-5 and abs(c["K"] - u["K"]) < 1e-5 for u in unique):
+                unique.append(c)
+
+        result.update({
+            "disponivel": True,
+            "linha_s2": [a, b],
+            "auxiliary": aux,
+            "aux_jw": aux_jw,
+            "char_re": char_re,
+            "char_im": char_im,
+            "omega_equation": omega_equation,
+            "k_expression": k_expression,
+            "omega_values": omega_values,
+            "calculos": calculations,
+            "cruzamentos": unique,
+        })
+        return result
+
     # ------------------------------------------------------------------
     # Passo 9 auxiliar: cruzamento analítico
     # ------------------------------------------------------------------
@@ -512,8 +702,14 @@ class AnalisadorLGR:
         except Exception:
             pass
 
-        # União com os pontos obtidos por Routh (fonte principal para a prova).
+        # Método solicitado para a resolução manual: usar a equação da linha s².
         routh = self.calcular_routh()
+        s2_method = self._cruzamento_por_equacao_s2(routh)
+        for item in s2_method["cruzamentos"]:
+            if not any(abs(item["w"] - c["w"]) < 1e-4 and abs(item["K"] - c["K"]) < 1e-4 for c in cruzamentos):
+                cruzamentos.append(item)
+
+        # União com os pontos obtidos diretamente da análise das raízes do Routh.
         for item in routh["crossing_candidates"]:
             kval = item["K"]
             for rr in item["imaginary_roots"]:
@@ -534,6 +730,7 @@ class AnalisadorLGR:
             "candidatos_w": candidatos_w,
             "cruzamentos": cruzamentos,
             "routh": routh,
+            "s2_method": s2_method,
         }
 
     # ------------------------------------------------------------------
@@ -607,13 +804,19 @@ class AnalisadorLGR:
 
         soma_polos = sum(v.angulo_deg for v in vet_polos)
         soma_zeros = sum(v.angulo_deg for v in vet_zeros)
-        fase_bruta = soma_zeros - soma_polos
+
+        # P(s) = C * prod(s-z_i) / prod(s-p_i).
+        # A fase de C é 0° para C>0 e 180° para C<0.
+        fase_bruta = self.fase_constante_deg + soma_zeros - soma_polos
         fase_mod = fase_bruta % 360.0
-        pertence = abs(((fase_mod + 180.0) % 360.0) - 180.0) < 1e-2
+        erro_angulo = abs(((fase_mod - 180.0 + 180.0) % 360.0) - 180.0)
+        pertence = erro_angulo < 1e-2
 
         mod_polos = float(np.prod([v.magnitude for v in vet_polos])) if vet_polos else 1.0
         mod_zeros = float(np.prod([v.magnitude for v in vet_zeros])) if vet_zeros else 1.0
-        K_val = mod_polos / mod_zeros if pertence else None
+        ganho_abs = abs(float(sp.N(self.ganho_constante)))
+        # |K C| prod|s-z|/prod|s-p| = 1.
+        K_val = mod_polos / (ganho_abs * mod_zeros) if pertence else None
 
         return {
             "s_teste": s_teste,
@@ -621,8 +824,11 @@ class AnalisadorLGR:
             "vetores_zeros": vet_zeros,
             "soma_angulos_polos": soma_polos,
             "soma_angulos_zeros": soma_zeros,
+            "fase_constante_deg": self.fase_constante_deg,
+            "ganho_constante": self.ganho_constante,
             "fase_bruta": fase_bruta,
             "fase_mod": fase_mod,
+            "erro_angulo": erro_angulo,
             "pertence": pertence,
             "produto_mod_polos": mod_polos,
             "produto_mod_zeros": mod_zeros,

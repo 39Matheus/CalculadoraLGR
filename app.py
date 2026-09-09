@@ -148,6 +148,10 @@ if submit_button:
         st.latex(
             rf"P(s)=\frac{{{latex(p1['num_expr'])}}}{{{latex(p1['den_expr'])}}}"
         )
+        st.markdown("**Forma fatorada de $P(s)$:**")
+        st.latex(
+            rf"P(s)={latex_factor(p1['gh'])}=C\frac{{\prod_j(s-z_j)}}{{\prod_i(s-p_i)}},\qquad C={latex(analisador.ganho_constante)}"
+        )
         st.markdown("**Polinômio característico da malha fechada:**")
         st.latex(rf"\Phi(s,K) = {latex(p1['char_expr'])}=0")
         st.markdown(r"**Coeficientes de $\Phi(s,K)$, do maior grau para o menor:**")
@@ -170,6 +174,14 @@ if submit_button:
         else:
             st.write("Nenhum zero finito.")
         st.write(f"$n_P={analisador.np}$ e $n_Z={analisador.nz}$.")
+        grupos_polos = analisador._group_points(analisador.polos)
+        grupos_mult = [g for g in grupos_polos if g["multiplicity"] > 1]
+        if grupos_mult:
+            for g in grupos_mult:
+                st.info(
+                    f"Pólo múltiplo em {fmt_complex(g['point'])}: multiplicidade "
+                    f"{g['multiplicity']}. No gráfico, o marcador desse pólo recebe menor opacidade para facilitar a visualização dos ramos."
+                )
 
         # ------------------------------------------------------------------
         # Passo 3
@@ -183,7 +195,7 @@ if submit_button:
         # ------------------------------------------------------------------
         st.subheader("Passo 4 — Segmentos do eixo real que pertencem ao LGR")
         st.markdown(
-            "Regra usada no material: um ponto pertence ao LGR quando há um "
+            "Um ponto pertence ao LGR quando há um "
             "**número ímpar de pólos e zeros reais à sua direita**."
         )
         for item in p4["testes"]:
@@ -235,8 +247,8 @@ if submit_button:
         # Passo 8
         # ------------------------------------------------------------------
         st.subheader("Passo 8 — Ponto(s) de saída/chegada no eixo real")
-        st.markdown("A resolução segue exatamente a ideia do material: primeiro isolamos $K$ como função de $s$ e depois impomos $dK/ds=0$.")
-        st.latex(rf"K(s)=-\frac{{D(s)}}{{N(s)}}=-\frac{{{latex(p8['den_expr'])}}}{{{latex(p8['num_expr'])}}}")
+        st.markdown("Primeiro isolamos $K$ como função de $s$ e depois impomos $dK/ds=0$.")
+        st.latex(rf"K(s)=-\frac{{D(s)}}{{N(s)}}=-\frac{{{latex(p8['K_den'])}}}{{{latex(p8['K_num'])}}}")
         st.markdown("**Derivando:**")
         st.latex(rf"\frac{{dK}}{{ds}}={latex(p8['dK_ds'])}")
         st.markdown("**Forma equivalente para zerar o numerador:**")
@@ -280,10 +292,48 @@ if submit_button:
         except Exception:
             st.write("A desigualdade simbólica não pôde ser reduzida automaticamente; use os elementos da primeira coluna acima.")
 
+        if p9["routh"]["used_epsilon"]:
+            st.warning(r"Foi necessário introduzir $\epsilon>0$ no cálculo da tabela de Routh porque apareceu um primeiro elemento nulo em uma linha.")
+
         if p9["routh"]["K_candidates"]:
             st.markdown("**Valores de $K$ candidatos obtidos anulando a primeira coluna:**")
             for kval in p9["routh"]["K_candidates"]:
                 st.latex(rf"K={kval:.6f}")
+
+        # Método pedido pelo professor: usar explicitamente a equação da linha s²
+        # para as substituições e a determinação do ganho no cruzamento.
+        s2 = p9.get("s2_method", {})
+        if s2.get("disponivel"):
+            st.markdown("**Determinação do cruzamento usando a equação da linha $s^2$:**")
+            a, b = s2["linha_s2"]
+            st.latex(rf"\text{{Linha }}s^2:\quad {latex(a)}s^2+{latex(b)}=0")
+            st.latex(rf"s=j\omega\Longrightarrow s^2=-\omega^2\Longrightarrow {latex(s2['aux_jw'])}=0")
+            if s2.get("k_expression") is not None:
+                st.latex(rf"\text{{Da equação de }}s^2:\quad K={latex(s2['k_expression'])}")
+            st.latex(rf"Re[\Phi(j\omega,K)]={latex(s2['char_re'])}")
+            st.latex(rf"Im[\Phi(j\omega,K)]={latex(s2['char_im'])}")
+            st.latex(rf"\frac{{Im[\Phi(j\omega,K)]}}{{\omega}}=0\quad(\omega\ne0)\Longrightarrow {latex(s2['omega_equation'])}=0")
+            for omega in s2.get("omega_values", []):
+                st.latex(rf"\omega={omega:.6f}")
+            for calc in s2.get("calculos", []):
+                if s2.get("k_expression") is not None:
+                    k_sub = sp.N(s2["k_expression"].subs(analisador.w, calc["w"]))
+                    st.latex(
+                        rf"\omega={calc['w']:.6f}\Longrightarrow "
+                        rf"K={latex(s2['k_expression'])}\Big|_{{\omega={calc['w']:.6f}}}="
+                        rf"{float(k_sub):.6f}"
+                    )
+                else:
+                    st.latex(
+                        rf"\omega={calc['w']:.6f}\Longrightarrow "
+                        rf"{latex(s2['aux_jw'])}=0\Longrightarrow K={calc['K']:.6f}"
+                    )
+                st.latex(
+                    rf"\text{{Verificação: }}Re[\Phi]={calc['real_residual']:.3e},\quad "
+                    rf"Im[\Phi]={calc['imag_residual']:.3e}"
+                )
+        else:
+            st.info(r"A equação da linha $s^2$ não está disponível para este grau do polinômio; foi usado o procedimento geral de cruzamento.")
 
         st.markdown(r"**Polinômio característico em $s=j\omega$:**")
         st.latex(rf"D(j\omega)={latex(p9['D_jw'])}")
@@ -361,11 +411,12 @@ if submit_button:
             render_vector_details(ptest["vetores_zeros"], "zeros do ponto de teste")
 
         st.latex(
+            rf"\arg(C)={ptest['fase_constante_deg']:.4f}^\circ,\qquad "
             rf"\sum\theta_i={ptest['soma_angulos_polos']:.4f}^\circ,\qquad "
             rf"\sum\phi_j={ptest['soma_angulos_zeros']:.4f}^\circ"
         )
         st.latex(
-            rf"\angle P(s_t)=\sum\phi_j-\sum\theta_i="
+            rf"\angle P(s_t)=\arg(C)+\sum\phi_j-\sum\theta_i="
             rf"{ptest['fase_bruta']:.4f}^\circ\equiv {ptest['fase_mod']:.4f}^\circ\pmod{{360^\circ}}"
         )
 
@@ -379,10 +430,14 @@ if submit_button:
         # ------------------------------------------------------------------
         st.subheader("Passo 12 — Determinar o ganho $K$ pelo critério de módulo")
         if ptest["pertence"]:
-            st.latex(r"|K P(s_t)|=1\Longrightarrow K=\frac{\prod|s_t-p_i|}{\prod|s_t-z_i|}")
+            st.latex(r"|K P(s_t)|=1\Longrightarrow K=\frac{\prod_i|s_t-p_i|}{|C|\prod_j|s_t-z_j|}")
             st.latex(
-                rf"K=\frac{{{ptest['produto_mod_polos']:.6f}}}{{{ptest['produto_mod_zeros']:.6f}}}="
+                rf"K=\frac{{{ptest['produto_mod_polos']:.6f}}}{{"
+                rf"|{latex(ptest['ganho_constante'])}|\times {ptest['produto_mod_zeros']:.6f}}}="
                 rf"{ptest['K']:.6f}"
+            )
+            st.markdown(
+                rf"Aqui, $C={latex(ptest['ganho_constante'])}$ é o ganho constante da forma fatorada de $P(s)$."
             )
             st.info(f"Logo, para $s_t={ponto_teste}$, o ganho é **K = {ptest['K']:.6f}**.")
         else:
