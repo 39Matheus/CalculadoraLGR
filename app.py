@@ -475,14 +475,38 @@ if submit_button:
             ponto_teste=ponto_teste,
         )
 
-        st.download_button(
-            label="Baixar resolução completa em PDF",
-            data=pdf_resolucao,
-            file_name="resolucao_LGR.pdf",
-            mime="application/pdf",
-            on_click="ignore",
-            use_container_width=True,
+        col_pdf1, col_pdf2 = st.columns(2)
+
+        with col_pdf1:
+            st.download_button(
+                label="Baixar resolução completa em PDF",
+                data=pdf_resolucao,
+                file_name="resolucao_LGR_completa.pdf",
+                mime="application/pdf",
+                on_click="ignore",
+                use_container_width=True,
+            )
+
+        pdf_prova = analisador.gerar_pdf_modo_prova(
+            p1=p1,
+            p4=p4,
+            p7=p7,
+            p8=p8,
+            p9=p9,
+            p10=p10,
+            ptest=ptest,
+            ponto_teste=ponto_teste,
         )
+
+        with col_pdf2:
+            st.download_button(
+                label="Baixar PDF — Modo Prova",
+                data=pdf_prova,
+                file_name="resolucao_LGR_modo_prova.pdf",
+                mime="application/pdf",
+                on_click="ignore",
+                use_container_width=True,
+            )
 
     except Exception as exc:
         st.error("Erro na execução. Verifique os coeficientes informados.")
