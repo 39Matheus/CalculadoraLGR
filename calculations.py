@@ -1,4 +1,8 @@
 import math
+import os
+import shutil
+import subprocess
+import tempfile
 import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -1206,6 +1210,396 @@ class AnalisadorLGR:
         text = text.replace("sqrt", "√")
         text = text.replace("I", "j")
         return text
+
+    @staticmethod
+    def _tex_expr(expr):
+        """Renderiza uma expressão SymPy como LaTeX, tentando eliminar ruído numérico."""
+        if expr is None:
+            return r"-"
+        try:
+            clean = sp.nsimplify(sp.expand(expr), tolerance=1e-8, rational=True)
+            clean = sp.cancel(clean)
+            return sp.latex(clean)
+        except Exception:
+            return sp.latex(sp.expand(sp.sympify(expr)))
+
+    @staticmethod
+    def _tex_escape(text):
+        """Escapa texto comum para uso dentro do documento LaTeX."""
+        replacements = {
+            "\\": r"\textbackslash{}",
+            "&": r"\&",
+            "%": r"\%",
+            "$": r"\$",
+            "#": r"\#",
+            "_": r"\_",
+            "{": r"\{",
+            "}": r"\}",
+            "~": r"\textasciitilde{}",
+            "^": r"\textasciicircum{}",
+        }
+        return "".join(replacements.get(ch, ch) for ch in str(text))
+
+    @staticmethod
+    def _tex_complex(z, digits=4):
+        """Forma compacta de número complexo para matemática LaTeX."""
+        z = complex(z)
+        if abs(z.imag) < 10 ** (-digits):
+            return f"{z.real:.{digits}f}"
+        sign = "+" if z.imag >= 0 else "-"
+        return rf"{z.real:.{digits}f} {sign} {abs(z.imag):.{digits}f}j"
+
+    @staticmethod
+    def _tex_interval(a, b, digits=4):
+        left = r"-\infty" if math.isinf(a) and a < 0 else f"{a:.{digits}f}"
+        right = r"+\infty" if math.isinf(b) and b > 0 else f"{b:.{digits}f}"
+        return rf"({left}, {right})"
+
+    def gerar_pdf_modo_prova(
+        self, p1, p4, p7, p8, p9, p10, ptest, ponto_teste,
+    ) -> bytes:
+        """Gera uma versão enxuta do PDF, otimizada para copiar durante a prova.
+
+        O documento é compilado com LaTeX real (pdflatex), para melhorar a
+        leitura de fórmulas, frações, subscritos e símbolos matemáticos.
+        """
+        self._pdf_test_point = ponto_teste
+        if self._last_rlist is None:
+            self.calcular_lgr_exato()
+
+        # O LaTeX é o caminho preferencial. Se não estiver instalado, usamos
+        # um fallback COMPACTO próprio do Modo Prova -- nunca o PDF completo.
+        pdflatex = shutil.which("pdflatex")
+        if pdflatex is None:
+            return self._gerar_pdf_modo_prova_fallback(
+                p1, p4, p7, p8, p9, p10, ptest, ponto_teste
+            )
+
+        def eq(expr):
+            return rf"\[{expr}\]"
+
+        doc_lines = [
+            r"\documentclass[10pt,a4paper]{article}",
+            r"\usepackage[utf8]{inputenc}",
+            r"\usepackage[T1]{fontenc}",
+            r"\usepackage[brazil]{babel}",
+            r"\usepackage{lmodern}",
+            r"\usepackage{amsmath,amssymb,mathtools}",
+            r"\usepackage[a4paper,margin=1.35cm]{geometry}",
+            r"\usepackage{graphicx}",
+            r"\usepackage{booktabs}",
+            r"\usepackage{microtype}",
+            r"\setlength{\parindent}{0pt}",
+            r"\setlength{\parskip}{3pt}",
+            r"\newcommand{\passo}[1]{\vspace{7pt}\par\noindent\textbf{#1}\par\smallskip\nobreak}",
+            r"\newcommand{\resultado}[1]{\vspace{1pt}\fbox{\parbox{0.97\linewidth}{#1}}\vspace{2pt}}",
+            r"\begin{document}",
+            r"\begin{center}",
+            r"{\Large\bfseries Lugar Geométrico das Raízes -- Modo Prova}\\[-1mm]",
+            r"{\small Roteiro enxuto para reprodução manual em papel}",
+            r"\end{center}",
+        ]
+
+        # Dados do problema
+        doc_lines.append(r"\passo{Dados do problema}")
+        doc_lines.append(eq(rf"G(s)=\frac{{{self._tex_expr(self._poly_to_expr(self.numG))}}}{{{self._tex_expr(self._poly_to_expr(self.denG))}}}\qquad H(s)=\frac{{{self._tex_expr(self._poly_to_expr(self.numH))}}}{{{self._tex_expr(self._poly_to_expr(self.denH))}}}"))
+        doc_lines.append(eq(rf"s_t={self._tex_complex(ponto_teste,4)}"))
+
+        # Passo 1
+        doc_lines.append(r"\passo{1. Polinômio característico}")
+        doc_lines.append(eq(r"1+K P(s)=0"))
+        doc_lines.append(eq(rf"\Phi(s,K)={self._tex_expr(p1['char_expr'])}=0"))
+
+        # Passo 2
+        doc_lines.append(r"\passo{2. Pólos e zeros}")
+        poles = r"\; ;\;".join(self._tex_complex(x,4) for x in self.polos) if self.polos else r"\varnothing"
+        zeros = r"\; ;\;".join(self._tex_complex(x,4) for x in self.zeros) if self.zeros else r"\varnothing"
+        doc_lines.append(eq(rf"p_i=\{{{poles}\}},\qquad z_j=\{{{zeros}\}}"))
+        doc_lines.append(eq(rf"n_P={self.np},\qquad n_Z={self.nz}"))
+
+        # Passos 3-6
+        doc_lines.append(r"\passo{3--6. Esboço, eixo real, ramos e simetria}")
+        segs = p4.get("segmentos", [])
+        seg_text = r"\; ;\;".join(self._tex_interval(a,b,4) for a,b in segs) if segs else r"\varnothing"
+        doc_lines.append(eq(rf"\text{{Segmentos reais do LGR: }}{seg_text}"))
+        doc_lines.append(eq(rf"n_{{ramos}}=n_P={self.np}"))
+        doc_lines.append(r"\textit{Como os coeficientes são reais, o LGR é simétrico em relação ao eixo real.}")
+
+        # Passo 7
+        doc_lines.append(r"\passo{7. Assíntotas}")
+        if p7.get("numero", 0) > 0:
+            angles = r"\; ;\;".join(f"{a:.2f}^\\circ" for a in p7.get("angulos", []))
+            doc_lines.append(eq(rf"q=n_P-n_Z={p7['numero']},\qquad \sigma_A={p7['centro']:.6f}"))
+            doc_lines.append(eq(rf"\phi_A={angles}"))
+        else:
+            doc_lines.append(eq(r"q=n_P-n_Z\le 0\Rightarrow\text{ sem assíntotas para }\infty"))
+
+        # Passo 8
+        doc_lines.append(r"\passo{8. Pontos de saída/chegada}")
+        doc_lines.append(eq(r"K(s)=-\frac{D(s)}{N(s)},\qquad D'(s)N(s)-D(s)N'(s)=0"))
+        valid = [c for c in p8.get("candidatos", []) if c.get("real") and c.get("valido")]
+        if valid:
+            for c in valid:
+                k = c.get("K")
+                kval = "--" if k is None else f"{k:.6f}"
+                doc_lines.append(eq(rf"s_b={c['s'].real:.6f},\qquad K_b={kval}"))
+        else:
+            doc_lines.append(r"Não foi encontrado ponto válido para $K>0$ nos segmentos reais.")
+
+        # Passo 9
+        doc_lines.append(r"\passo{9. Cruzamento do eixo imaginário (Routh-Hurwitz)}")
+        routh = p9.get("routh", {})
+        table = routh.get("table", [])
+        if table:
+            max_cols = max(len(row) for _, row in table)
+            cols = "c" * (max_cols + 1)
+            doc_lines.append(rf"\begin{{center}}\small\begin{{tabular}}{{{cols}}}")
+            doc_lines.append(r"\toprule")
+            header = " & ".join([r"Linha"] + [rf"$c_{i+1}$" for i in range(max_cols)]) + " \\\\" 
+            doc_lines.append(header)
+            doc_lines.append(r"\midrule")
+            for power, row in table:
+                cells = [rf"$s^{{{int(power)}}}$"] + [rf"${self._tex_expr(v)}$" for v in row]
+                cells += [r"$0$"] * (max_cols - len(row))
+                doc_lines.append(" & ".join(cells) + " \\\\" )
+            doc_lines.append(r"\bottomrule")
+            doc_lines.append(r"\end{tabular}\end{center}")
+        crossings = p9.get("cruzamentos", [])
+        if crossings:
+            for c in crossings:
+                doc_lines.append(eq(rf"\boxed{{s=\pm j{c['w']:.6f},\qquad K={c['K']:.6f}}}"))
+        else:
+            doc_lines.append(eq(r"\text{Não há cruzamento detectado para }K>0."))
+
+        # Passo 10
+        doc_lines.append(r"\passo{10. Ângulos de partida/chegada}")
+        if p10.get("resultados"):
+            for item in p10["resultados"]:
+                ponto = self._tex_complex(item["ponto"], 4)
+                if item["tipo"] == "partida":
+                    expr = rf"\theta_{{partida}}=180^\circ-({item['soma_polos']:.4f}^\circ)+({item['soma_zeros']:.4f}^\circ)={item['angulo']:.4f}^\circ"
+                else:
+                    expr = rf"\theta_{{chegada}}=180^\circ-({item['soma_zeros']:.4f}^\circ)+({item['soma_polos']:.4f}^\circ)={item['angulo']:.4f}^\circ"
+                doc_lines.append(eq(rf"s={ponto}:\quad {expr}"))
+        else:
+            doc_lines.append(r"Não há pólos/zeros complexos que exijam cálculo de ângulo.")
+
+        # Passos 11-12
+        doc_lines.append(r"\passo{11. Teste da condição de ângulo}")
+        doc_lines.append(eq(rf"\angle P(s_t)={ptest['fase_mod']:.4f}^\circ\qquad(\text{{alvo: }}180^\circ\;\bmod\;360^\circ)"))
+        pertence = bool(ptest.get("pertence"))
+        status = "PERTENCE" if pertence else "NÃO PERTENCE"
+        doc_lines.append(rf"\resultado{{\textbf{{{status} ao LGR para }}$K>0$.}}")
+
+        doc_lines.append(r"\passo{12. Ganho pelo critério de módulo}")
+        if pertence:
+            doc_lines.append(eq(r"|K P(s_t)|=1\Rightarrow K=\frac{\prod_i|s_t-p_i|}{|C|\prod_j|s_t-z_j|}"))
+            doc_lines.append(eq(rf"\boxed{{K={ptest['K']:.6f}}}"))
+        else:
+            doc_lines.append(r"Como a condição de ângulo não foi satisfeita, não se calcula $K$ para $K>0$.")
+
+        # Gráfico
+        try:
+            graph_bytes = self._gerar_grafico_png_pdf()
+            with tempfile.TemporaryDirectory() as td:
+                td_path = Path(td)
+                (td_path / "lgr.png").write_bytes(graph_bytes.getvalue())
+                doc_lines.extend([
+                    r"\passo{Diagrama final do LGR}",
+                    r"\begin{center}",
+                    r"\includegraphics[width=0.72\linewidth]{lgr.png}",
+                    r"\end{center}",
+                    r"\vfill",
+                    r"\begin{center}\small\textit{Modo Prova: use as expressões acima como roteiro e reproduza no papel apenas o que o enunciado exigir.}\end{center}",
+                    r"\end{document}",
+                ])
+                tex_path = td_path / "resolucao_LGR_modo_prova.tex"
+                tex_path.write_text("\n".join(doc_lines), encoding="utf-8")
+                result = subprocess.run(
+                    [pdflatex, "-interaction=nonstopmode", "-halt-on-error", tex_path.name],
+                    cwd=td_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30, check=False,
+                )
+                pdf_path = td_path / "resolucao_LGR_modo_prova.pdf"
+                if result.returncode == 0 and pdf_path.exists():
+                    return pdf_path.read_bytes()
+                # Uma segunda compilação costuma resolver referências auxiliares.
+                subprocess.run(
+                    [pdflatex, "-interaction=nonstopmode", tex_path.name],
+                    cwd=td_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=30, check=False,
+                )
+                if pdf_path.exists():
+                    return pdf_path.read_bytes()
+        except Exception:
+            pass
+
+        # Se o LaTeX estiver instalado mas a compilação falhar, não mascaramos
+        # o problema devolvendo o PDF completo. O usuário ainda recebe um PDF
+        # COMPACTO de Modo Prova, mantendo a finalidade do botão.
+        return self._gerar_pdf_modo_prova_fallback(
+            p1, p4, p7, p8, p9, p10, ptest, ponto_teste
+        )
+
+    def _gerar_pdf_modo_prova_fallback(
+        self, p1, p4, p7, p8, p9, p10, ptest, ponto_teste,
+    ) -> bytes:
+        """Fallback compacto do Modo Prova quando pdflatex não está disponível.
+
+        Esta versão NÃO chama ``gerar_pdf_resolucao``: mesmo sem LaTeX, o botão
+        continua entregando um relatório enxuto, com as contas essenciais para
+        reprodução manual.
+        """
+        font_regular, font_bold = self._pdf_font_setup()
+        self._pdf_test_point = ponto_teste
+        if self._last_rlist is None:
+            self.calcular_lgr_exato()
+
+        buf = BytesIO()
+        doc = SimpleDocTemplate(
+            buf, pagesize=A4,
+            rightMargin=1.25 * cm, leftMargin=1.25 * cm,
+            topMargin=1.15 * cm, bottomMargin=1.15 * cm,
+            title="LGR - Modo Prova",
+            author="Calculadora LGR",
+        )
+        styles = getSampleStyleSheet()
+        title = ParagraphStyle(
+            "MPTitle", parent=styles["Title"], fontName=font_bold,
+            fontSize=16, leading=19, alignment=TA_CENTER, spaceAfter=7,
+        )
+        h1 = ParagraphStyle(
+            "MPH1", parent=styles["Heading1"], fontName=font_bold,
+            fontSize=10.5, leading=12.5, spaceBefore=5, spaceAfter=3,
+        )
+        body = ParagraphStyle(
+            "MPBody", parent=styles["BodyText"], fontName=font_regular,
+            fontSize=8.1, leading=10, spaceAfter=2.5,
+        )
+        eq = ParagraphStyle(
+            "MPEq", parent=body, fontSize=8.3, leading=10.5,
+            leftIndent=6, spaceAfter=2,
+        )
+        small = ParagraphStyle(
+            "MPSmall", parent=body, fontSize=7.1, leading=8.4,
+        )
+
+        story = [
+            Paragraph("Lugar Geométrico das Raízes — Modo Prova", title),
+            Paragraph(
+                "Versão compacta para reprodução manual. LaTeX indisponível: usando formato compacto de emergência.",
+                small,
+            ),
+        ]
+
+        def add_eq(text):
+            story.append(Paragraph(escape(text), eq))
+
+        # Dados + 1/2
+        story.append(Paragraph("Dados", h1))
+        add_eq(f"G(s) = {self._pdf_expr(self._poly_to_expr(self.numG))} / {self._pdf_expr(self._poly_to_expr(self.denG))}")
+        add_eq(f"H(s) = {self._pdf_expr(self._poly_to_expr(self.numH))} / {self._pdf_expr(self._poly_to_expr(self.denH))}")
+        add_eq(f"s_t = {self._fmt_complex(complex(ponto_teste), 4)}")
+
+        story.append(Paragraph("1. Polinômio característico", h1))
+        add_eq(f"1 + K·P(s) = 0")
+        add_eq(f"Φ(s,K) = {self._pdf_expr(p1['char_expr'])} = 0")
+
+        story.append(Paragraph("2. Pólos e zeros", h1))
+        add_eq("Pólos: " + (", ".join(self._fmt_complex(p, 4) for p in self.polos) or "nenhum"))
+        add_eq("Zeros: " + (", ".join(self._fmt_complex(z, 4) for z in self.zeros) or "nenhum"))
+        add_eq(f"nP = {self.np}; nZ = {self.nz}")
+
+        story.append(Paragraph("3–6. Plano-s, eixo real, ramos e simetria", h1))
+        segs = p4.get("segmentos", [])
+        seg_text = ", ".join(
+            f"({'-∞' if math.isinf(a) else f'{a:.4f}'}, {'+∞' if math.isinf(b) else f'{b:.4f}'})"
+            for a, b in segs
+        ) or "nenhum"
+        add_eq(f"Segmentos reais: {seg_text}")
+        add_eq(f"n_ramos = nP = {self.np}; simétrico em relação ao eixo real.")
+
+        story.append(Paragraph("7. Assíntotas", h1))
+        if p7.get("numero", 0) > 0:
+            angles = ", ".join(f"{a:.2f}°" for a in p7.get("angulos", []))
+            add_eq(f"q = nP − nZ = {p7['numero']}; σA = {p7['centro']:.5f}; φA = {angles}")
+        else:
+            add_eq("Sem assíntotas para o infinito.")
+
+        story.append(Paragraph("8. Saída/chegada", h1))
+        add_eq("K(s) = −D(s)/N(s);   D'(s)N(s) − D(s)N'(s) = 0")
+        valid = [c for c in p8.get("candidatos", []) if c.get("real") and c.get("valido")]
+        if valid:
+            add_eq("; ".join(
+                f"s_b = {c['s'].real:.5f}, K_b = {c['K']:.6f}"
+                for c in valid
+            ))
+        else:
+            add_eq("Nenhum ponto válido para K > 0 nos segmentos reais.")
+
+        story.append(Paragraph("9. Cruzamento do eixo imaginário — Routh", h1))
+        table = p9.get("routh", {}).get("table", [])
+        if table:
+            max_cols = max(len(row) for _, row in table)
+            data = [["Linha"] + [f"C{i+1}" for i in range(max_cols)]]
+            for power, row in table:
+                data.append([f"s^{int(power)}"] + [self._pdf_expr(v) for v in row] + ["0"]*(max_cols-len(row)))
+            t = Table(data, repeatRows=1, hAlign="LEFT")
+            t.setStyle(TableStyle([
+                ("FONTNAME", (0,0), (-1,-1), font_regular),
+                ("FONTNAME", (0,0), (-1,0), font_bold),
+                ("FONTSIZE", (0,0), (-1,-1), 6.8),
+                ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+                ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                ("LEFTPADDING", (0,0), (-1,-1), 3),
+                ("RIGHTPADDING", (0,0), (-1,-1), 3),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 3))
+        crossings = p9.get("cruzamentos", [])
+        if crossings:
+            for c in crossings:
+                add_eq(f"CRUZAMENTO: s = ±j{c['w']:.6f};   K = {c['K']:.6f}")
+        else:
+            add_eq("Nenhum cruzamento detectado para K > 0.")
+
+        story.append(Paragraph("10. Ângulos de partida/chegada", h1))
+        if p10.get("resultados"):
+            for item in p10["resultados"]:
+                tipo = "partida" if item["tipo"] == "partida" else "chegada"
+                if item["tipo"] == "partida":
+                    add_eq(
+                        f"s = {self._fmt_complex(item['ponto'],4)}: θ_partida = 180° − ({item['soma_polos']:.3f}°) + ({item['soma_zeros']:.3f}°) = {item['angulo']:.3f}°"
+                    )
+                else:
+                    add_eq(
+                        f"s = {self._fmt_complex(item['ponto'],4)}: θ_chegada = 180° − ({item['soma_zeros']:.3f}°) + ({item['soma_polos']:.3f}°) = {item['angulo']:.3f}°"
+                    )
+
+        story.append(Paragraph("11. Condição de ângulo", h1))
+        add_eq(f"∠P(s_t) = {ptest['fase_mod']:.4f}°  (alvo 180° mod 360°)")
+        add_eq("RESULTADO: " + ("PERTENCE ao LGR para K > 0." if ptest["pertence"] else "NÃO PERTENCE ao LGR para K > 0."))
+
+        story.append(Paragraph("12. Ganho K", h1))
+        if ptest["pertence"]:
+            add_eq(f"K = Π|s_t−p_i| / (|C|·Π|s_t−z_j|) = {ptest['K']:.6f}")
+        else:
+            add_eq("K não é calculado: condição de ângulo não satisfeita.")
+
+        story.append(PageBreak())
+        story.append(Paragraph("Diagrama final do LGR", h1))
+        story.append(Image(self._gerar_grafico_png_pdf(), width=17.0*cm, height=12.0*cm))
+
+        def footer(canvas, doc):
+            canvas.saveState()
+            canvas.setFont(font_regular, 7)
+            canvas.drawString(1.25*cm, 0.65*cm, "Calculadora LGR — Modo Prova")
+            canvas.drawRightString(A4[0]-1.25*cm, 0.65*cm, f"Página {doc.page}")
+            canvas.restoreState()
+
+        doc.build(story, onFirstPage=footer, onLaterPages=footer)
+        return buf.getvalue()
 
     def _gerar_grafico_png_pdf(self):
         """Gera uma imagem estática do LGR para inserir no PDF."""
